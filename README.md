@@ -1,2 +1,2 @@
 # devops-shop
-Frontend and backend for the Shop application
+Backend for the Shop application
