@@ -1,29 +1,25 @@
-import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
-import { App } from 'supertest/types';
-import { AppModule } from './../src/app.module';
+import { ShopTestApp, startShopApp, stopShopApp } from './shop-app';
 
 describe('AppController (e2e)', () => {
-  let app: INestApplication<App>;
+  let testApp: ShopTestApp;
 
-  beforeEach(async () => {
-    const moduleFixture: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
+  beforeAll(async () => {
+    testApp = await startShopApp();
+  }, 180_000);
 
-    app = moduleFixture.createNestApplication();
-    await app.init();
+  afterAll(async () => {
+    await stopShopApp(testApp);
   });
 
-  it('/ (GET)', () => {
-    return request(app.getHttpServer())
-      .get('/')
+  it('serves the root under the api/v1 prefix', () => {
+    return request(testApp.app.getHttpServer())
+      .get('/api/v1')
       .expect(200)
       .expect('Hello World!');
   });
 
-  afterEach(async () => {
-    await app.close();
+  it('does not serve anything outside the prefix', () => {
+    return request(testApp.app.getHttpServer()).get('/').expect(404);
   });
 });
