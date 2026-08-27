@@ -31,9 +31,6 @@ export class Article {
   @Column({ type: 'int', default: 0 })
   quantity: number;
 
-  @Column({ name: 'image_url', type: 'varchar', length: 512, nullable: true })
-  imageUrl: string | null;
-
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

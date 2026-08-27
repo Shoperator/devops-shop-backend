@@ -1,7 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DeepPartial, In, Repository } from 'typeorm';
+import { DeepPartial, FindOptionsWhere, ILike, In, Repository } from 'typeorm';
 import { Article } from './entities/article.entity';
+
+export interface ArticlePageOptions {
+  /** Case-insensitive match on name or description. */
+  search?: string;
+  skip: number;
+  take: number;
+}
 
 @Injectable()
 export class ArticleRepository {
@@ -12,6 +19,29 @@ export class ArticleRepository {
 
   findAll(): Promise<Article[]> {
     return this.articles.find({ order: { createdAt: 'DESC' } });
+  }
+
+  /** Returns the requested page together with the total match count. */
+  findPage(options: ArticlePageOptions): Promise<[Article[], number]> {
+    const { search, skip, take } = options;
+
+    // An array of conditions is an OR in TypeORM.
+    const where: FindOptionsWhere<Article>[] | undefined =
+      search === undefined
+        ? undefined
+        : [
+            { name: ILike(`%${search}%`) },
+            { description: ILike(`%${search}%`) },
+          ];
+
+    return this.articles.findAndCount({
+      where,
+      // `id` breaks ties so two articles saved in the same millisecond cannot
+      // swap places between page 1 and page 2.
+      order: { createdAt: 'DESC', id: 'DESC' },
+      skip,
+      take,
+    });
   }
 
   findById(id: string): Promise<Article | null> {
