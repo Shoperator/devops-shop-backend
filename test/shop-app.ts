@@ -4,9 +4,11 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
+import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
-import { configureApp } from '../src/app.setup';
+import { API_PREFIX, configureApp } from '../src/app.setup';
+import { UserRole } from '../src/users/entities/user.entity';
 
 /** Credentials the AdminSeeder provisions while the tests run. */
 export const SEEDED_ADMIN = {
@@ -74,4 +76,53 @@ let usernameCounter = 0;
 export function uniqueUsername(prefix: string): string {
   usernameCounter += 1;
   return `${prefix}-${usernameCounter}`;
+}
+
+/** The HTTP server of a booted test app, as supertest wants it. */
+export type TestServer = ReturnType<INestApplication<App>['getHttpServer']>;
+
+export interface TestSession {
+  accessToken: string;
+  user: {
+    id: string;
+    username: string;
+    displayName: string;
+    role: UserRole;
+    walletAddress: string | null;
+  };
+}
+
+const TEST_PASSWORD = 'sup3r-secret';
+
+export async function signIn(
+  server: TestServer,
+  username: string,
+  password: string,
+): Promise<TestSession> {
+  const response = await request(server)
+    .post(`/${API_PREFIX}/auth/login`)
+    .send({ username, password })
+    .expect(200);
+
+  return response.body as TestSession;
+}
+
+/** Signs in as the admin the AdminSeeder provisioned for the test shop. */
+export function signInAsAdmin(server: TestServer): Promise<TestSession> {
+  return signIn(server, SEEDED_ADMIN.username, SEEDED_ADMIN.password);
+}
+
+/** Registers a fresh customer and returns their signed-in session. */
+export async function signInAsCustomer(
+  server: TestServer,
+  prefix = 'buyer',
+): Promise<TestSession> {
+  const username = uniqueUsername(prefix);
+
+  await request(server)
+    .post(`/${API_PREFIX}/auth/register`)
+    .send({ username, displayName: 'Buyer One', password: TEST_PASSWORD })
+    .expect(201);
+
+  return signIn(server, username, TEST_PASSWORD);
 }
