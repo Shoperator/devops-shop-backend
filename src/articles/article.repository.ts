@@ -1,6 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DeepPartial, FindOptionsWhere, ILike, In, Repository } from 'typeorm';
+import {
+  DeepPartial,
+  EntityManager,
+  FindOptionsWhere,
+  ILike,
+  In,
+  Repository,
+} from 'typeorm';
 import { Article } from './entities/article.entity';
 
 export interface ArticlePageOptions {
@@ -16,6 +23,15 @@ export class ArticleRepository {
     @InjectRepository(Article)
     private readonly articles: Repository<Article>,
   ) {}
+
+  /**
+   * The repository bound to the caller's transaction when there is one. Checkout
+   * reserves stock and writes the order in a single transaction, and both have
+   * to run through the same manager for the rollback to cover them.
+   */
+  private repository(manager?: EntityManager): Repository<Article> {
+    return manager?.getRepository(Article) ?? this.articles;
+  }
 
   findAll(): Promise<Article[]> {
     return this.articles.find({ order: { createdAt: 'DESC' } });
@@ -48,11 +64,58 @@ export class ArticleRepository {
     return this.articles.findOne({ where: { id } });
   }
 
-  findByIds(ids: string[]): Promise<Article[]> {
+  findByIds(ids: string[], manager?: EntityManager): Promise<Article[]> {
     if (ids.length === 0) {
       return Promise.resolve([]);
     }
-    return this.articles.find({ where: { id: In(ids) } });
+    return this.repository(manager).find({ where: { id: In(ids) } });
+  }
+
+  /**
+   * Takes `quantity` pieces off the shelf, or reports that there were not
+   * enough. The check and the decrement are one statement on purpose: two
+   * customers buying the last piece at the same moment cannot both win it, no
+   * matter how many replicas of the shop are running. A read-then-write would
+   * oversell.
+   */
+  async reserveStock(
+    id: string,
+    quantity: number,
+    manager?: EntityManager,
+  ): Promise<boolean> {
+    const result = await this.repository(manager)
+      .createQueryBuilder()
+      .update(Article)
+      .set({ quantity: () => 'quantity - :reserved' })
+      .where('id = :id', { id })
+      .andWhere('quantity >= :reserved')
+      .setParameter('reserved', quantity)
+      .execute();
+
+    return (result.affected ?? 0) > 0;
+  }
+
+  /**
+   * Puts reserved pieces back on the shelf when an order will not be paid.
+   *
+   * Unconditional, unlike reserving: adding stock back can never fail on a
+   * bound. `false` means the row is gone, which happens when the admin deleted
+   * the article while an order still held some of it.
+   */
+  async releaseStock(
+    id: string,
+    quantity: number,
+    manager?: EntityManager,
+  ): Promise<boolean> {
+    const result = await this.repository(manager)
+      .createQueryBuilder()
+      .update(Article)
+      .set({ quantity: () => 'quantity + :released' })
+      .where('id = :id', { id })
+      .setParameter('released', quantity)
+      .execute();
+
+    return (result.affected ?? 0) > 0;
   }
 
   create(data: DeepPartial<Article>): Article {
