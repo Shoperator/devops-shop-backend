@@ -1,12 +1,10 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import {
-  PostgreSqlContainer,
-  StartedPostgreSqlContainer,
-} from '@testcontainers/postgresql';
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import { RedisContainer } from '@testcontainers/redis';
+import { StartedTestContainer } from 'testcontainers';
 import request from 'supertest';
 import { App } from 'supertest/types';
-import { AppModule } from '../src/app.module';
 import { API_PREFIX, configureApp } from '../src/app.setup';
 import { UserRole } from '../src/users/entities/user.entity';
 
@@ -17,30 +15,37 @@ export const SEEDED_ADMIN = {
   displayName: 'Integration Admin',
 };
 
+/** Which database the shop under test was "deployed" with. */
+export type TestStore = 'postgres' | 'redis';
+
 export interface ShopTestApp {
   app: INestApplication<App>;
-  container: StartedPostgreSqlContainer;
+  container: StartedTestContainer;
 }
 
 /**
- * Boots the whole application against a throwaway PostgreSQL container, so the
- * integration tests hit real SQL, real guards and the real validation pipeline.
+ * Boots the whole application against a throwaway database, so the integration
+ * tests hit a real store, real guards and the real validation pipeline.
+ *
+ * `AppModule` is imported here rather than at the top of the file on purpose:
+ * it decides which repositories exist from `DB_KIND` while its decorator is
+ * evaluated, so the environment has to be set before the module is loaded. Jest
+ * gives every test file its own module registry, so each suite gets the store
+ * it asked for.
  */
-export async function startShopApp(): Promise<ShopTestApp> {
-  const container = await new PostgreSqlContainer('postgres:17-alpine').start();
+export async function startShopApp(
+  store: TestStore = 'postgres',
+): Promise<ShopTestApp> {
+  const container =
+    store === 'redis' ? await startRedis() : await startPostgres();
 
-  // ConfigService reads process.env first, so this wins over any local .env.
-  process.env.DB_HOST = container.getHost();
-  process.env.DB_PORT = String(container.getPort());
-  process.env.DB_USERNAME = container.getUsername();
-  process.env.DB_PASSWORD = container.getPassword();
-  process.env.DB_NAME = container.getDatabase();
-  process.env.DB_SYNCHRONIZE = 'true';
   process.env.JWT_SECRET = 'integration-test-secret';
   process.env.JWT_EXPIRES_IN = '15m';
   process.env.SHOP_ADMIN_USERNAME = SEEDED_ADMIN.username;
   process.env.SHOP_ADMIN_PASSWORD = SEEDED_ADMIN.password;
   process.env.SHOP_ADMIN_DISPLAY_NAME = SEEDED_ADMIN.displayName;
+
+  const { AppModule } = loadAppModule();
 
   const moduleRef = await Test.createTestingModule({
     imports: [AppModule],
@@ -51,6 +56,47 @@ export async function startShopApp(): Promise<ShopTestApp> {
   await app.init();
 
   return { app, container };
+}
+
+/**
+ * Loads the application module after the environment is in place.
+ *
+ * A top-level import would be hoisted above the settings above, and `AppModule`
+ * decides which repositories exist while it is being evaluated — so by then the
+ * store would already be chosen. `require` rather than `import()` because Jest
+ * runs this as CommonJS, and its module registry is per test file, so each
+ * suite still gets its own evaluation.
+ */
+/* eslint-disable @typescript-eslint/no-require-imports */
+function loadAppModule(): typeof import('../src/app.module') {
+  return require('../src/app.module') as typeof import('../src/app.module');
+}
+/* eslint-enable @typescript-eslint/no-require-imports */
+
+// ConfigService reads process.env first, so these win over any local .env.
+async function startPostgres(): Promise<StartedTestContainer> {
+  const container = await new PostgreSqlContainer('postgres:17-alpine').start();
+
+  process.env.DB_KIND = 'postgresql';
+  process.env.DB_HOST = container.getHost();
+  process.env.DB_PORT = String(container.getPort());
+  process.env.DB_USERNAME = container.getUsername();
+  process.env.DB_PASSWORD = container.getPassword();
+  process.env.DB_NAME = container.getDatabase();
+  process.env.DB_SYNCHRONIZE = 'true';
+
+  return container;
+}
+
+async function startRedis(): Promise<StartedTestContainer> {
+  const container = await new RedisContainer('redis:7-alpine').start();
+
+  process.env.DB_KIND = 'redis';
+  process.env.REDIS_HOST = container.getHost();
+  process.env.REDIS_PORT = String(container.getPort());
+  process.env.REDIS_PASSWORD = '';
+
+  return container;
 }
 
 /** Tolerates a failed startup so the real error is what the suite reports. */

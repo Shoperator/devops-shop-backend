@@ -11,7 +11,9 @@ import { UsersModule } from './users/users.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    DatabaseModule,
+    // Picks PostgreSQL or Redis from DB_KIND and provides the repositories the
+    // rest of the application injects.
+    DatabaseModule.forRoot(),
     AuthModule,
     ArticlesModule,
     OrdersModule,

@@ -1,9 +1,8 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { compare } from 'bcryptjs';
-import { QueryFailedError } from 'typeorm';
 import { User, UserRole } from './entities/user.entity';
-import { UserRepository } from './user.repository';
+import { USER_REPOSITORY, UsernameTakenError } from './user.repository';
 import { UsersService } from './users.service';
 
 const PASSWORD = 'sup3r-secret';
@@ -36,7 +35,7 @@ describe('UsersService', () => {
     const moduleRef = await Test.createTestingModule({
       providers: [
         UsersService,
-        { provide: UserRepository, useValue: userRepository },
+        { provide: USER_REPOSITORY, useValue: userRepository },
       ],
     }).compile();
 
@@ -73,13 +72,12 @@ describe('UsersService', () => {
       expect(userRepository.save).not.toHaveBeenCalled();
     });
 
-    it('turns a unique violation into a conflict, not a 500', async () => {
+    it('turns a taken username into a conflict, not a 500', async () => {
       // Two simultaneous registrations both pass the existsByUsername check and
-      // only the database catches the duplicate.
+      // only the store catches the duplicate — a unique index in PostgreSQL, a
+      // set-if-absent in Redis, the same error either way.
       userRepository.save.mockRejectedValue(
-        new QueryFailedError('insert into users', [], {
-          code: '23505',
-        } as unknown as Error),
+        new UsernameTakenError(registration.username),
       );
 
       await expect(

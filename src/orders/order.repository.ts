@@ -1,12 +1,8 @@
-import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import {
-  DeepPartial,
-  EntityManager,
-  FindOptionsWhere,
-  Repository,
-} from 'typeorm';
+import { OrderItem } from './entities/order-item';
 import { Order, OrderStatus } from './entities/order.entity';
+
+/** Injection token for the order store. See {@link ArticleRepository}. */
+export const ORDER_REPOSITORY = 'ORDER_REPOSITORY';
 
 export interface OrderPageOptions {
   status?: OrderStatus;
@@ -16,91 +12,65 @@ export interface OrderPageOptions {
   take: number;
 }
 
-@Injectable()
-export class OrderRepository {
-  constructor(
-    @InjectRepository(Order)
-    private readonly orders: Repository<Order>,
-  ) {}
+/**
+ * A priced basket, ready to become an order. The service has already looked the
+ * articles up and copied their name and price into the items, so the store only
+ * has to deal with quantities.
+ */
+export interface OrderDraft {
+  buyerId: string;
+  items: OrderItem[];
+  total: number;
+  currency: string;
+}
 
-  /** The repository bound to the caller's transaction when there is one. */
-  private repository(manager?: EntityManager): Repository<Order> {
-    return manager?.getRepository(Order) ?? this.orders;
-  }
+export type PlaceOrderResult =
+  | { placed: true; order: Order }
+  /** The article that could not be reserved; nothing was taken off any shelf. */
+  | { placed: false; articleId: string };
 
-  findAll(): Promise<Order[]> {
-    return this.orders.find({ order: { createdAt: 'DESC' } });
-  }
+export type FailPaymentResult =
+  | { failed: true; order: Order }
+  | { failed: false; reason: 'not-found' | 'not-pending' };
 
+/**
+ * Orders, and the two operations that have to be all-or-nothing.
+ *
+ * `placeOrder` and `failPayment` are on the store rather than composed in the
+ * service on purpose. Both span several keys — every article in the basket plus
+ * the order itself — and the only component that can make a multi-key change
+ * atomic is the store that holds them. Expressing them as one call each lets
+ * PostgreSQL use a transaction and Redis use a single script, and keeps the
+ * guarantee identical either way instead of leaving the service to undo half a
+ * checkout by hand.
+ *
+ * Pricing and validation stay in the service: the store is told what to write,
+ * never what an order is worth.
+ */
+export interface OrderRepository {
   /** Returns the requested page together with the total match count. */
-  findPage(options: OrderPageOptions): Promise<[Order[], number]> {
-    const { status, buyerId, skip, take } = options;
+  findPage(options: OrderPageOptions): Promise<[Order[], number]>;
 
-    const where: FindOptionsWhere<Order> = {};
-    if (status !== undefined) {
-      where.status = status;
-    }
-    if (buyerId !== undefined) {
-      where.buyerId = buyerId;
-    }
-
-    return this.orders.findAndCount({
-      where,
-      // The admin listing shows who ordered, so the buyer is joined in rather
-      // than fetched one query per row.
-      relations: { buyer: true },
-      // `id` breaks ties so pages stay stable for orders sharing a timestamp.
-      order: { createdAt: 'DESC', id: 'DESC' },
-      skip,
-      take,
-    });
-  }
-
-  findByBuyerId(buyerId: string): Promise<Order[]> {
-    return this.orders.find({
-      where: { buyerId },
-      order: { createdAt: 'DESC' },
-    });
-  }
-
-  findById(id: string, manager?: EntityManager): Promise<Order | null> {
-    return this.repository(manager).findOne({
-      where: { id },
-      relations: { buyer: true },
-    });
-  }
+  findById(id: string): Promise<Order | null>;
 
   /**
-   * Moves an order from one status to another, and reports whether this call
-   * is the one that did it.
+   * Reserves every line's stock and writes the order, or does neither.
    *
-   * The `from` status is part of the statement rather than something the caller
-   * checked a moment ago: two payment results racing each other would otherwise
-   * both see PENDING and both put the same pieces back on the shelf. Only the
-   * winner gets `true`.
+   * Reserving is a check and a decrement in one step, so two customers buying
+   * the last piece at the same moment cannot both win it, however many replicas
+   * of the shop are running.
    */
-  async transitionStatus(
-    id: string,
-    from: OrderStatus,
-    to: OrderStatus,
-    manager?: EntityManager,
-  ): Promise<boolean> {
-    const result = await this.repository(manager)
-      .createQueryBuilder()
-      .update(Order)
-      .set({ status: to })
-      .where('id = :id', { id })
-      .andWhere('status = :from', { from })
-      .execute();
+  placeOrder(draft: OrderDraft): Promise<PlaceOrderResult>;
 
-    return (result.affected ?? 0) > 0;
-  }
-
-  create(data: DeepPartial<Order>): Order {
-    return this.orders.create(data);
-  }
-
-  save(order: Order, manager?: EntityManager): Promise<Order> {
-    return this.repository(manager).save(order);
-  }
+  /**
+   * Moves a PENDING order to FAILED and puts the pieces it was holding back on
+   * the shelf, as one step.
+   *
+   * Checkout reserves stock before the money has moved, so an order whose
+   * payment never settles would otherwise hold those pieces forever. Only the
+   * caller that wins the status change releases the stock, so a payment result
+   * delivered twice cannot return the same pieces twice. An article the admin
+   * deleted meanwhile is skipped — there is no shelf left to put it back on.
+   */
+  failPayment(id: string): Promise<FailPaymentResult>;
 }

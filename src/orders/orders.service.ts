@@ -1,20 +1,21 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, EntityManager } from 'typeorm';
-import { ArticleRepository } from '../articles/article.repository';
+import { ARTICLE_REPOSITORY } from '../articles/article.repository';
+import type { ArticleRepository } from '../articles/article.repository';
 import { PageDto } from '../common/dto/page.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
 import { OrderItem } from './entities/order-item';
-import { Order, OrderStatus } from './entities/order.entity';
-import { OrderRepository } from './order.repository';
+import { Order } from './entities/order.entity';
+import { ORDER_REPOSITORY } from './order.repository';
+import type { OrderRepository } from './order.repository';
 
 /** The crypto currency this shop prices and settles in. */
 const SHOP_CURRENCY = 'USDT';
@@ -32,9 +33,10 @@ export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
 
   constructor(
+    @Inject(ORDER_REPOSITORY)
     private readonly orderRepository: OrderRepository,
+    @Inject(ARTICLE_REPOSITORY)
     private readonly articleRepository: ArticleRepository,
-    @InjectDataSource() private readonly dataSource: DataSource,
   ) {}
 
   /** Every order in the shop, newest first. Admin only. */
@@ -73,9 +75,11 @@ export class OrdersService {
   /**
    * Turns a customer's basket into an order.
    *
-   * Reserving the stock and writing the order share one transaction: if the
-   * second article in a basket has run out, the pieces already taken off the
-   * shelf for the first one go back, and no half-order is left behind.
+   * The basket is priced here and committed by the store in one step: if the
+   * second article has run out, the pieces already counted for the first one
+   * were never taken off the shelf, and no half-order is left behind. Which
+   * mechanism makes that true — a transaction or a script — is the store's
+   * business.
    */
   async checkout(buyerId: string, dto: CreateOrderDto): Promise<Order> {
     const articleIds = dto.items.map((item) => item.articleId);
@@ -85,60 +89,48 @@ export class OrdersService {
       );
     }
 
-    const order = await this.dataSource.transaction(async (manager) => {
-      const articles = await this.articleRepository.findByIds(
-        articleIds,
-        manager,
-      );
-      const byId = new Map(articles.map((article) => [article.id, article]));
+    const articles = await this.articleRepository.findByIds(articleIds);
+    const byId = new Map(articles.map((article) => [article.id, article]));
 
-      const items: OrderItem[] = [];
-      let total = 0;
+    const items: OrderItem[] = [];
+    let total = 0;
 
-      for (const line of dto.items) {
-        const article = byId.get(line.articleId);
-        if (article === undefined) {
-          throw new NotFoundException(`Article ${line.articleId} not found`);
-        }
-
-        const reserved = await this.articleRepository.reserveStock(
-          article.id,
-          line.quantity,
-          manager,
-        );
-        if (!reserved) {
-          throw new ConflictException(
-            `"${article.name}" does not have ${line.quantity} piece(s) left`,
-          );
-        }
-
-        // The price is copied in, not referenced: amount payed is what the
-        // article cost at checkout, even if price changes in meantime.
-        items.push({
-          articleId: article.id,
-          articleName: article.name,
-          unitPrice: article.price,
-          quantity: line.quantity,
-        });
-        total += article.price * line.quantity;
+    for (const line of dto.items) {
+      const article = byId.get(line.articleId);
+      if (article === undefined) {
+        throw new NotFoundException(`Article ${line.articleId} not found`);
       }
 
-      // payment processing with blockchain wallet to be implemented
-      // Until then an order is created unpaid: the stock is held for the
-      // customer and the status says the money has not arrived yet. When the
-      // payment comes back rejected, `markPaymentFailed` puts it back.
-      return this.orderRepository.save(
-        this.orderRepository.create({
-          buyerId,
-          items,
-          total: toMoney(total),
-          currency: SHOP_CURRENCY,
-          status: OrderStatus.PENDING,
-        }),
-        manager,
-      );
+      // The price is copied in, not referenced: the amount paid is what the
+      // article cost at checkout, even if the price changes in the meantime.
+      items.push({
+        articleId: article.id,
+        articleName: article.name,
+        unitPrice: article.price,
+        quantity: line.quantity,
+      });
+      total += article.price * line.quantity;
+    }
+
+    // Payment processing with a blockchain wallet is still to be implemented.
+    // Until then an order is created unpaid: the stock is held for the customer
+    // and the status says the money has not arrived yet. When the payment comes
+    // back rejected, `markPaymentFailed` puts it back.
+    const result = await this.orderRepository.placeOrder({
+      buyerId,
+      items,
+      total: toMoney(total),
+      currency: SHOP_CURRENCY,
     });
 
+    if (!result.placed) {
+      const line = items.find((item) => item.articleId === result.articleId);
+      throw new ConflictException(
+        `"${line?.articleName ?? result.articleId}" does not have ${line?.quantity ?? 0} piece(s) left`,
+      );
+    }
+
+    const { order } = result;
     this.logger.log(
       `Order created: ${order.id} by ${buyerId} (${order.items.length} article(s), ${order.total} ${order.currency})`,
     );
@@ -161,58 +153,20 @@ export class OrdersService {
    * payment result delivered twice cannot return the same pieces twice.
    */
   async markPaymentFailed(id: string): Promise<Order> {
-    return this.dataSource.transaction(async (manager) => {
-      const order = await this.orderRepository.findById(id, manager);
-      if (order === null) {
+    const result = await this.orderRepository.failPayment(id);
+
+    if (!result.failed) {
+      if (result.reason === 'not-found') {
         throw new NotFoundException(`Order ${id} not found`);
       }
-
-      const hasFailed = await this.orderRepository.transitionStatus(
-        id,
-        OrderStatus.PENDING,
-        OrderStatus.FAILED,
-        manager,
+      throw new ConflictException(
+        `Order ${id} is no longer pending, so its stock was not released again`,
       );
-      if (!hasFailed) {
-        throw new ConflictException(
-          `Order ${id} is no longer pending, so its stock was not released again`,
-        );
-      }
-
-      // Reached only by the caller that won the status change, so the stock
-      // goes back exactly once however many payment results arrive at once. It
-      // shares the transaction with that change: if a release fails, the order
-      // stays pending rather than ending up failed with its stock lost.
-      await this.releaseStock(order, manager);
-
-      this.logger.log(
-        `Order failed, stock released: ${id} (${order.items.length} article(s))`,
-      );
-
-      // Re-read so the caller gets the new status and timestamp.
-      return (await this.orderRepository.findById(id, manager)) ?? order;
-    });
-  }
-
-  private async releaseStock(
-    order: Order,
-    manager: EntityManager,
-  ): Promise<void> {
-    for (const item of order.items) {
-      const released = await this.articleRepository.releaseStock(
-        item.articleId,
-        item.quantity,
-        manager,
-      );
-
-      if (!released) {
-        // The admin deleted the article while this order was pending. There is
-        // no shelf left to put the pieces back on, and that is not a reason to
-        // keep the customer's order alive.
-        this.logger.warn(
-          `Order ${order.id}: could not return ${item.quantity} piece(s) of deleted article ${item.articleId}`,
-        );
-      }
     }
+
+    this.logger.log(
+      `Order failed, stock released: ${id} (${result.order.items.length} article(s))`,
+    );
+    return result.order;
   }
 }

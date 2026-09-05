@@ -1,15 +1,13 @@
 import { Module } from '@nestjs/common';
-import { TypeOrmModule } from '@nestjs/typeorm';
 import { AdminSeeder } from './admin-seeder.service';
-import { User } from './entities/user.entity';
-import { UserRepository } from './user.repository';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
 
+// The repository comes from the global DatabaseModule, which binds it to the
+// store this shop was deployed with.
 @Module({
-  imports: [TypeOrmModule.forFeature([User])],
   controllers: [UsersController],
-  providers: [UsersService, UserRepository, AdminSeeder],
-  exports: [UsersService, UserRepository],
+  providers: [UsersService, AdminSeeder],
+  exports: [UsersService],
 })
 export class UsersModule {}

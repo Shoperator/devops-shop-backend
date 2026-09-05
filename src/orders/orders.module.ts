@@ -1,15 +1,14 @@
 import { Module } from '@nestjs/common';
-import { TypeOrmModule } from '@nestjs/typeorm';
 import { ArticlesModule } from '../articles/articles.module';
-import { Order } from './entities/order.entity';
-import { OrderRepository } from './order.repository';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
 
+// The repositories come from the global DatabaseModule, which binds them to the
+// store this shop was deployed with.
 @Module({
-  imports: [TypeOrmModule.forFeature([Order]), ArticlesModule],
+  imports: [ArticlesModule],
   controllers: [OrdersController],
-  providers: [OrdersService, OrderRepository],
-  exports: [OrdersService, OrderRepository],
+  providers: [OrdersService],
+  exports: [OrdersService],
 })
 export class OrdersModule {}

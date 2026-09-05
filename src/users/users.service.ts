@@ -1,32 +1,26 @@
 import {
   ConflictException,
+  Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { hash } from 'bcryptjs';
-import { QueryFailedError } from 'typeorm';
 import { CreateUserDto } from './dto/create-user.dto';
 import { User, UserRole } from './entities/user.entity';
-import { UserRepository } from './user.repository';
+import type { UserRepository } from './user.repository';
+import { USER_REPOSITORY, UsernameTakenError } from './user.repository';
 
 const PASSWORD_SALT_ROUNDS = 10;
-
-/** PostgreSQL unique_violation. */
-const UNIQUE_VIOLATION = '23505';
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    error instanceof QueryFailedError &&
-    (error.driverError as { code?: string })?.code === UNIQUE_VIOLATION
-  );
-}
 
 /**
  * Shop users: the admin managing the catalogue and the customers buying from it.
  */
 @Injectable()
 export class UsersService {
-  constructor(private readonly userRepository: UserRepository) {}
+  constructor(
+    @Inject(USER_REPOSITORY)
+    private readonly userRepository: UserRepository,
+  ) {}
 
   /** Self-registration always creates a customer; admins are provisioned. */
   createCustomer(dto: CreateUserDto): Promise<User> {
@@ -51,8 +45,9 @@ export class UsersService {
     try {
       return await this.userRepository.save(user);
     } catch (error) {
-      // Two registrations for the same username can pass the check above.
-      if (isUniqueViolation(error)) {
+      // Two registrations for the same username can both pass the check above,
+      // so the store is what settles it — however it does that.
+      if (error instanceof UsernameTakenError) {
         throw new ConflictException(
           `Username "${dto.username}" is already taken`,
         );
