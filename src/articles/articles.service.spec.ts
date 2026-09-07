@@ -1,6 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { ArticleRepository } from './article.repository';
+import { ARTICLE_REPOSITORY } from './article.repository';
 import { ArticlesService } from './articles.service';
 import { ArticleQueryDto } from './dto/article-query.dto';
 import { Article } from './entities/article.entity';
@@ -45,7 +45,7 @@ describe('ArticlesService', () => {
     const moduleRef = await Test.createTestingModule({
       providers: [
         ArticlesService,
-        { provide: ArticleRepository, useValue: articleRepository },
+        { provide: ARTICLE_REPOSITORY, useValue: articleRepository },
       ],
     }).compile();
 

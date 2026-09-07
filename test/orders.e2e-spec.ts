@@ -1,7 +1,8 @@
+import { getDataSourceToken } from '@nestjs/typeorm';
 import request from 'supertest';
+import { DataSource } from 'typeorm';
 import { OrderItem } from '../src/orders/entities/order-item';
 import { Order, OrderStatus } from '../src/orders/entities/order.entity';
-import { OrderRepository } from '../src/orders/order.repository';
 import { OrdersService } from '../src/orders/orders.service';
 import {
   ShopTestApp,
@@ -51,7 +52,7 @@ interface ArticleResponse {
 describe('Orders (e2e)', () => {
   let testApp: ShopTestApp;
   let server: TestServer;
-  let orderRepository: OrderRepository;
+  let dataSource: DataSource;
   let ordersService: OrdersService;
   let admin: TestSession;
   let customer: TestSession;
@@ -59,7 +60,7 @@ describe('Orders (e2e)', () => {
   beforeAll(async () => {
     testApp = await startShopApp();
     server = testApp.app.getHttpServer();
-    orderRepository = testApp.app.get(OrderRepository);
+    dataSource = testApp.app.get(getDataSourceToken());
     ordersService = testApp.app.get(OrdersService);
     admin = await signInAsAdmin(server);
     customer = await signInAsCustomer(server);
@@ -96,9 +97,13 @@ describe('Orders (e2e)', () => {
     return response.body as ArticleResponse;
   }
 
+  // Plants an order directly, which is the only way to produce a status the
+  // application cannot reach yet. These suites run on the PostgreSQL
+  // deployment, so they may reach for its DataSource.
   function seedOrder(overrides: Partial<Order> = {}): Promise<Order> {
-    return orderRepository.save(
-      orderRepository.create({
+    const orders = dataSource.getRepository(Order);
+    return orders.save(
+      orders.create({
         buyerId: customer.user.id,
         items: [
           {
@@ -412,10 +417,11 @@ describe('Orders (e2e)', () => {
     it('never releases the stock of an order that was paid', async () => {
       const article = await createArticle({ quantity: 8 });
       const order = await buy(article.id, 3);
-      await orderRepository.transitionStatus(
-        order.id,
-        OrderStatus.PENDING,
-        OrderStatus.PAID,
+      await dataSource.getRepository(Order).update(
+        { id: order.id, status: OrderStatus.PENDING },
+        {
+          status: OrderStatus.PAID,
+        },
       );
 
       await expect(ordersService.markPaymentFailed(order.id)).rejects.toThrow();

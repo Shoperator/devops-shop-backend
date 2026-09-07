@@ -3,15 +3,13 @@ import {
   ConflictException,
   NotFoundException,
 } from '@nestjs/common';
-import { getDataSourceToken } from '@nestjs/typeorm';
 import { Test } from '@nestjs/testing';
-import { EntityManager } from 'typeorm';
-import { ArticleRepository } from '../articles/article.repository';
+import { ARTICLE_REPOSITORY } from '../articles/article.repository';
 import { Article } from '../articles/entities/article.entity';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
 import { Order, OrderStatus } from './entities/order.entity';
-import { OrderRepository } from './order.repository';
+import { OrderDraft, ORDER_REPOSITORY } from './order.repository';
 import { OrdersService } from './orders.service';
 
 const BUYER_ID = 'c0000000-0000-4000-8000-000000000001';
@@ -60,52 +58,59 @@ function query(overrides: Partial<OrderQueryDto> = {}): OrderQueryDto {
   return Object.assign(new OrderQueryDto(), overrides);
 }
 
+/**
+ * What the service is responsible for once the store owns atomicity: pricing a
+ * basket, refusing one that cannot be priced, and turning the store's answer
+ * into the right HTTP failure.
+ *
+ * That stock is reserved and released exactly once is a promise of the store
+ * itself, and is covered against a real PostgreSQL and a real Redis in the
+ * integration tests — a mock cannot tell you whether a transaction or a script
+ * actually held.
+ */
 describe('OrdersService', () => {
   let ordersService: OrdersService;
   let orderRepository: {
     findPage: jest.Mock;
     findById: jest.Mock;
-    create: jest.Mock;
-    save: jest.Mock;
-    transitionStatus: jest.Mock;
+    placeOrder: jest.Mock;
+    failPayment: jest.Mock;
   };
   let articleRepository: {
     findByIds: jest.Mock;
-    reserveStock: jest.Mock;
-    releaseStock: jest.Mock;
   };
-  let transactionManager: EntityManager;
 
   beforeEach(async () => {
-    transactionManager = {} as EntityManager;
-
     orderRepository = {
       findPage: jest.fn().mockResolvedValue([[], 0]),
       findById: jest.fn(),
-      create: jest.fn((data: Partial<Order>) => data as Order),
-      save: jest.fn((order: Order) => Promise.resolve(order)),
-      transitionStatus: jest.fn().mockResolvedValue(true),
+      // Answers with the order the draft describes, so the assertions below can
+      // read back what the service priced.
+      placeOrder: jest.fn((draft: OrderDraft) =>
+        Promise.resolve({
+          placed: true,
+          order: orderFixture({
+            buyerId: draft.buyerId,
+            items: draft.items,
+            total: draft.total,
+            currency: draft.currency,
+          }),
+        }),
+      ),
+      failPayment: jest.fn(() =>
+        Promise.resolve({ failed: true, order: orderFixture() }),
+      ),
     };
 
     articleRepository = {
       findByIds: jest.fn().mockResolvedValue([articleFixture()]),
-      reserveStock: jest.fn().mockResolvedValue(true),
-      releaseStock: jest.fn().mockResolvedValue(true),
-    };
-
-    const dataSource = {
-      transaction: jest.fn(
-        (runInTransaction: (manager: EntityManager) => Promise<unknown>) =>
-          runInTransaction(transactionManager),
-      ),
     };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         OrdersService,
-        { provide: OrderRepository, useValue: orderRepository },
-        { provide: ArticleRepository, useValue: articleRepository },
-        { provide: getDataSourceToken(), useValue: dataSource },
+        { provide: ORDER_REPOSITORY, useValue: orderRepository },
+        { provide: ARTICLE_REPOSITORY, useValue: articleRepository },
       ],
     }).compile();
 
@@ -198,18 +203,22 @@ describe('OrdersService', () => {
     });
 
     it('copies the name and price out of the catalogue, not out of the request', async () => {
-      const order = await ordersService.checkout(BUYER_ID, {
+      await ordersService.checkout(BUYER_ID, {
         items: [{ articleId: TEA_ID, quantity: 2 }],
       });
 
-      expect(order.items).toEqual([
-        {
-          articleId: TEA_ID,
-          articleName: 'Green tea',
-          unitPrice: 12.5,
-          quantity: 2,
-        },
-      ]);
+      expect(orderRepository.placeOrder).toHaveBeenCalledWith(
+        expect.objectContaining({
+          items: [
+            {
+              articleId: TEA_ID,
+              articleName: 'Green tea',
+              unitPrice: 12.5,
+              quantity: 2,
+            },
+          ],
+        }),
+      );
     });
 
     it('adds the lines up itself', async () => {
@@ -241,75 +250,46 @@ describe('OrdersService', () => {
       expect(order.total).toBe(0.3);
     });
 
-    it('takes the pieces off the shelf', async () => {
+    it('hands the store one priced basket to commit', async () => {
       await ordersService.checkout(BUYER_ID, {
         items: [{ articleId: TEA_ID, quantity: 2 }],
       });
 
-      expect(articleRepository.reserveStock).toHaveBeenCalledWith(
-        TEA_ID,
-        2,
-        transactionManager,
-      );
-    });
-
-    it('reserves the stock and saves the order in one transaction', async () => {
-      await ordersService.checkout(BUYER_ID, {
-        items: [{ articleId: TEA_ID, quantity: 2 }],
+      // One call, so reserving the stock and writing the order are one step
+      // whichever store is underneath.
+      expect(orderRepository.placeOrder).toHaveBeenCalledTimes(1);
+      expect(orderRepository.placeOrder).toHaveBeenCalledWith({
+        buyerId: BUYER_ID,
+        items: expect.any(Array) as unknown[],
+        total: 25,
+        currency: 'USDT',
       });
-
-      // Both writes go through the same manager, so a failure rolls back both.
-      expect(articleRepository.reserveStock).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.any(Number),
-        transactionManager,
-      );
-      expect(orderRepository.save).toHaveBeenCalledWith(
-        expect.anything(),
-        transactionManager,
-      );
     });
 
-    it('refuses an article that ran out, without writing an order', async () => {
-      articleRepository.reserveStock.mockResolvedValue(false);
+    it('refuses an article that ran out', async () => {
+      orderRepository.placeOrder.mockResolvedValue({
+        placed: false,
+        articleId: TEA_ID,
+      });
 
       await expect(
         ordersService.checkout(BUYER_ID, {
           items: [{ articleId: TEA_ID, quantity: 99 }],
         }),
       ).rejects.toBeInstanceOf(ConflictException);
-      expect(orderRepository.save).not.toHaveBeenCalled();
     });
 
     it('names the article the customer cannot have', async () => {
-      articleRepository.reserveStock.mockResolvedValue(false);
+      orderRepository.placeOrder.mockResolvedValue({
+        placed: false,
+        articleId: TEA_ID,
+      });
 
       await expect(
         ordersService.checkout(BUYER_ID, {
           items: [{ articleId: TEA_ID, quantity: 99 }],
         }),
       ).rejects.toThrow('Green tea');
-    });
-
-    it('gives up when one line of the basket is out of stock', async () => {
-      articleRepository.findByIds.mockResolvedValue([
-        articleFixture(),
-        articleFixture({ id: MUG_ID, name: 'Mug' }),
-      ]);
-      // The tea is reserved, the mug is not: the transaction has to undo the tea.
-      articleRepository.reserveStock
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(false);
-
-      await expect(
-        ordersService.checkout(BUYER_ID, {
-          items: [
-            { articleId: TEA_ID, quantity: 1 },
-            { articleId: MUG_ID, quantity: 1 },
-          ],
-        }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(orderRepository.save).not.toHaveBeenCalled();
     });
 
     it('refuses an article the admin deleted while it sat in the basket', async () => {
@@ -320,7 +300,7 @@ describe('OrdersService', () => {
           items: [{ articleId: TEA_ID, quantity: 1 }],
         }),
       ).rejects.toBeInstanceOf(NotFoundException);
-      expect(articleRepository.reserveStock).not.toHaveBeenCalled();
+      expect(orderRepository.placeOrder).not.toHaveBeenCalled();
     });
 
     it('refuses the same article twice in one basket', async () => {
@@ -332,128 +312,46 @@ describe('OrdersService', () => {
           ],
         }),
       ).rejects.toBeInstanceOf(BadRequestException);
-      expect(articleRepository.reserveStock).not.toHaveBeenCalled();
+      expect(orderRepository.placeOrder).not.toHaveBeenCalled();
     });
   });
 
   describe('markPaymentFailed', () => {
-    const pendingOrder = orderFixture();
+    it('answers with the order the store failed', async () => {
+      const failed = orderFixture({ status: OrderStatus.FAILED });
+      orderRepository.failPayment.mockResolvedValue({
+        failed: true,
+        order: failed,
+      });
 
-    beforeEach(() => {
-      orderRepository.findById.mockResolvedValue(pendingOrder);
-    });
-
-    it('puts the pieces back on the shelf', async () => {
-      await ordersService.markPaymentFailed(pendingOrder.id);
-
-      expect(articleRepository.releaseStock).toHaveBeenCalledWith(
-        TEA_ID,
-        2,
-        transactionManager,
+      await expect(ordersService.markPaymentFailed(failed.id)).resolves.toBe(
+        failed,
       );
-    });
-
-    it('returns every line of a multi-article order', async () => {
-      orderRepository.findById.mockResolvedValue(
-        orderFixture({
-          items: [
-            {
-              articleId: TEA_ID,
-              articleName: 'Green tea',
-              unitPrice: 12.5,
-              quantity: 2,
-            },
-            {
-              articleId: MUG_ID,
-              articleName: 'Mug',
-              unitPrice: 4.2,
-              quantity: 1,
-            },
-          ],
-        }),
-      );
-
-      await ordersService.markPaymentFailed(pendingOrder.id);
-
-      expect(articleRepository.releaseStock).toHaveBeenCalledTimes(2);
-      expect(articleRepository.releaseStock).toHaveBeenCalledWith(
-        MUG_ID,
-        1,
-        transactionManager,
-      );
-    });
-
-    it('moves the order from pending to failed', async () => {
-      await ordersService.markPaymentFailed(pendingOrder.id);
-
-      expect(orderRepository.transitionStatus).toHaveBeenCalledWith(
-        pendingOrder.id,
-        OrderStatus.PENDING,
-        OrderStatus.FAILED,
-        transactionManager,
-      );
-    });
-
-    it('releases the stock in the same transaction as the status change', async () => {
-      await ordersService.markPaymentFailed(pendingOrder.id);
-
-      // A failed release must not leave a failed order with lost stock.
-      expect(orderRepository.transitionStatus).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.any(String),
-        expect.any(String),
-        transactionManager,
-      );
-      expect(articleRepository.releaseStock).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.any(Number),
-        transactionManager,
-      );
-    });
-
-    it('returns the stock only once when the same failure arrives twice', async () => {
-      // The loser of the conditional status change gets `false`, so a payment
-      // result delivered twice cannot return the same pieces twice.
-      orderRepository.transitionStatus.mockResolvedValue(false);
-
-      await expect(
-        ordersService.markPaymentFailed(pendingOrder.id),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(articleRepository.releaseStock).not.toHaveBeenCalled();
-    });
-
-    it('never releases the stock of an order that was paid', async () => {
-      // A paid order needs a refund, not a release, so the conditional status
-      // change matches nothing.
-      orderRepository.findById.mockResolvedValue(
-        orderFixture({ status: OrderStatus.PAID }),
-      );
-      orderRepository.transitionStatus.mockResolvedValue(false);
-
-      await expect(
-        ordersService.markPaymentFailed(pendingOrder.id),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(articleRepository.releaseStock).not.toHaveBeenCalled();
     });
 
     it('throws when the order does not exist', async () => {
-      orderRepository.findById.mockResolvedValue(null);
+      orderRepository.failPayment.mockResolvedValue({
+        failed: false,
+        reason: 'not-found',
+      });
 
       await expect(
         ordersService.markPaymentFailed('missing'),
       ).rejects.toBeInstanceOf(NotFoundException);
-      expect(orderRepository.transitionStatus).not.toHaveBeenCalled();
     });
 
-    it('still fails the order when an article was deleted meanwhile', async () => {
-      // There is no shelf left to put the pieces back on, and that is no
-      // reason to leave the order stuck as pending forever.
-      articleRepository.releaseStock.mockResolvedValue(false);
+    it('refuses an order that is no longer pending', async () => {
+      // A paid order needs a refund rather than a release, and one that already
+      // failed has had its stock returned once. Either way the store declines,
+      // so a payment result delivered twice cannot return the same pieces twice.
+      orderRepository.failPayment.mockResolvedValue({
+        failed: false,
+        reason: 'not-pending',
+      });
 
       await expect(
-        ordersService.markPaymentFailed(pendingOrder.id),
-      ).resolves.toBeDefined();
-      expect(orderRepository.transitionStatus).toHaveBeenCalled();
+        ordersService.markPaymentFailed(orderFixture().id),
+      ).rejects.toBeInstanceOf(ConflictException);
     });
   });
 });

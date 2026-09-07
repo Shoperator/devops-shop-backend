@@ -6,27 +6,71 @@ Backend for the Shop application.
 
 ```bash
 npm install
-docker compose up -d     # PostgreSQL
+docker compose up -d     # PostgreSQL and Redis
 npm run start:dev
 ```
+
+`docker compose` brings up both databases; `DB_KIND` in `.env` decides which one
+the app talks to. Switching between them is that variable and a restart -- see
+[Databases](#databases).
 
 ## Tests
 
 ```bash
 npm test         # unit tests
-npm run test:e2e # integration tests, needs Docker (Testcontainers starts PostgreSQL)
+npm run test:e2e # integration tests, needs Docker (Testcontainers starts the databases)
 ```
 
-The integration tests boot the whole application against a throwaway PostgreSQL
-container, so they exercise real SQL, the real guards and the real validation
-pipeline. Both suites run on every pull request.
+The integration tests boot the whole application against a throwaway database,
+so they exercise a real store, the real guards and the real validation pipeline.
+`redis-store.e2e-spec.ts` runs the same application on Redis and covers what
+only a real store can show: that a basket is all-or-nothing, and that two
+customers cannot both buy the last piece. Both suites run on every pull request.
+
+## Databases
+
+A shop is deployed with one of two databases, and `DB_KIND` says which:
+`postgresql` (ShopHub calls it `standard`) or `redis` (`light`). The Shop
+operator passes the Shop resource's `spec.database` through unchanged.
+
+Each domain declares what it needs from storage as an interface --
+`ArticleRepository`, `UserRepository`, `OrderRepository` -- and there are two
+implementations of each. `DatabaseModule.forRoot()` reads `DB_KIND` and binds
+the injection tokens to one set or the other; nothing else in the application
+knows which store it is talking to.
+
+The interesting part of the boundary is what has to be atomic. Checkout reserves
+stock for every line of a basket and writes the order, and either all of it
+happens or none of it does. That cannot be assembled from single-key calls in
+the service, because only the store can make a multi-key change atomic -- so it
+is one method, `placeOrder(draft)`, and each store keeps that promise its own
+way:
+
+| | PostgreSQL | Redis |
+| --- | --- | --- |
+| `placeOrder` | one transaction | one Lua script |
+| `failPayment` | one transaction | one Lua script |
+| unique usernames | unique index | `SET NX` on the username key |
+| catalogue order | `ORDER BY created_at DESC, id DESC` | sorted set scored by creation time |
+| search | `ILIKE` | read the index and filter in the app |
+
+The service prices the basket and decides what the failure means to a customer;
+the store decides how the write holds together.
+
+Redis pays for its lightness in the last row: a catalogue search and a listing
+filtered by status read the whole index and filter in the application, because
+Redis has no query planner to do it. That is fine for a shop's catalogue, and is
+part of what `light` means as a choice -- a shop with a large catalogue wants
+`standard`.
 
 ## Configuration
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `DB_KIND` | `postgresql` | Which store to use: `postgresql` or `redis` |
 | `DB_HOST` / `DB_PORT` / `DB_USERNAME` / `DB_PASSWORD` / `DB_NAME` | `localhost` / `5432` / `shop` / `shop` / `shop` | PostgreSQL, provisioned per shop by the CNPG operator |
 | `DB_SYNCHRONIZE` | `true` | Create the schema from the entities |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` / `REDIS_DB` | `localhost` / `6379` / — / `0` | Redis, provisioned per shop by the Redis operator |
 | `JWT_SECRET` | — | Signing key for access tokens |
 | `JWT_EXPIRES_IN` | `1d` | Access token lifetime |
 | `SHOP_ADMIN_USERNAME` / `SHOP_ADMIN_PASSWORD` / `SHOP_ADMIN_DISPLAY_NAME` | — | The shop owner's account, seeded on boot |
@@ -103,8 +147,8 @@ piece of work.
 Checkout reserves stock before the money has moved, so an order whose payment
 never settles would hold those articles.
 `OrdersService.markPaymentFailed(orderId)` is the release: it moves the order
-`PENDING → FAILED` and adds every line's pieces back to the catalogue, in one
-transaction. It has no HTTP route — it is not a customer or admin action but the
+`PENDING → FAILED` and adds every line's pieces back to the catalogue, as one
+step the store cannot be interrupted in the middle of. It has no HTTP route — it is not a customer or admin action but the
 call the blockchain payment integration makes when a payment is rejected, times
 out, or comes back short.
 

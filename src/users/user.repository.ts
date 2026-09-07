@@ -1,36 +1,42 @@
-import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { DeepPartial, Repository } from 'typeorm';
-import { User } from './entities/user.entity';
+import { User, UserRole } from './entities/user.entity';
 
-@Injectable()
-export class UserRepository {
-  constructor(
-    @InjectRepository(User)
-    private readonly users: Repository<User>,
-  ) {}
+/** Injection token for the user store. See {@link ArticleRepository}. */
+export const USER_REPOSITORY = 'USER_REPOSITORY';
 
-  findAll(): Promise<User[]> {
-    return this.users.find({ order: { createdAt: 'DESC' } });
+/**
+ * Raised by `save` when the username is already taken.
+ *
+ * Usernames are unique, and two registrations racing each other both pass a
+ * prior existence check — so the store is the only place that can settle it.
+ * How it does that differs (a unique index in PostgreSQL, a set-if-absent in
+ * Redis), and this error is what the two have in common.
+ */
+export class UsernameTakenError extends Error {
+  constructor(readonly username: string) {
+    super(`Username "${username}" is already taken`);
+    this.name = 'UsernameTakenError';
   }
+}
 
-  findById(id: string): Promise<User | null> {
-    return this.users.findOne({ where: { id } });
-  }
+/** The fields a new user is created from; the store fills in the rest. */
+export interface NewUser {
+  username: string;
+  displayName: string;
+  passwordHash: string;
+  walletAddress: string | null;
+  role: UserRole;
+}
 
-  findByUsername(username: string): Promise<User | null> {
-    return this.users.findOne({ where: { username } });
-  }
+export interface UserRepository {
+  findById(id: string): Promise<User | null>;
 
-  existsByUsername(username: string): Promise<boolean> {
-    return this.users.existsBy({ username });
-  }
+  findByUsername(username: string): Promise<User | null>;
 
-  create(data: DeepPartial<User>): User {
-    return this.users.create(data);
-  }
+  existsByUsername(username: string): Promise<boolean>;
 
-  save(user: User): Promise<User> {
-    return this.users.save(user);
-  }
+  /** Builds an unsaved user. The id and timestamps appear on save. */
+  create(data: NewUser): User;
+
+  /** @throws UsernameTakenError when the username was claimed meanwhile. */
+  save(user: User): Promise<User>;
 }

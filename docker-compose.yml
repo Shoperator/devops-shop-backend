@@ -17,5 +17,26 @@ services:
       timeout: 5s
       retries: 10
 
+  # The `light` database choice. Only one of the two is ever used by a running
+  # shop -- DB_KIND decides which -- but having both up means switching between
+  # them is an env var and a restart.
+  redis:
+    image: redis:7-alpine
+    container_name: shop-redis
+    restart: unless-stopped
+    # Persist to disk, so a restart does not empty the shop the way a cache
+    # would. The deployed shop gets the same from its Redis operator.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - shop-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   shop-postgres-data:
+  shop-redis-data:

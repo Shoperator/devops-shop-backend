@@ -1,6 +1,7 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PageDto } from '../common/dto/page.dto';
-import { ArticleRepository } from './article.repository';
+import type { ArticleRepository } from './article.repository';
+import { ARTICLE_REPOSITORY } from './article.repository';
 import { ArticleQueryDto } from './dto/article-query.dto';
 import { CreateArticleDto } from './dto/create-article.dto';
 import { UpdateArticleDto } from './dto/update-article.dto';
@@ -16,7 +17,10 @@ export class ArticlesService {
   // once a pod is replaced, so every mutation is logged.
   private readonly logger = new Logger(ArticlesService.name);
 
-  constructor(private readonly articleRepository: ArticleRepository) {}
+  constructor(
+    @Inject(ARTICLE_REPOSITORY)
+    private readonly articleRepository: ArticleRepository,
+  ) {}
 
   async list(query: ArticleQueryDto): Promise<PageDto<Article>> {
     const search = query.search?.trim();
