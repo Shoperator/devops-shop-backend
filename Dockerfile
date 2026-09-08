@@ -21,4 +21,4 @@ COPY --from=builder /app/dist ./dist
 COPY package*.json ./
 EXPOSE 3000
 USER node
-CMD ["node", "dist/main.js"]
+CMD ["node", "--require", "@opentelemetry/auto-instrumentations-node/register", "dist/main.js"]
