@@ -7,6 +7,12 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { API_PREFIX, configureApp } from '../src/app.setup';
 import { UserRole } from '../src/users/entities/user.entity';
+import {
+  ANVIL_ACCOUNTS,
+  ANVIL_CHAIN_ID,
+  startAnvil,
+  StartedAnvil,
+} from './anvil';
 
 /** Credentials the AdminSeeder provisions while the tests run. */
 export const SEEDED_ADMIN = {
@@ -21,6 +27,20 @@ export type TestStore = 'postgres' | 'redis';
 export interface ShopTestApp {
   app: INestApplication<App>;
   container: StartedTestContainer;
+  /** Set only when the suite asked for a chain; see `startShopApp`. */
+  anvil?: StartedAnvil;
+}
+
+export interface ShopAppOptions {
+  store?: TestStore;
+  /**
+   * Start a real chain and point the shop at it.
+   *
+   * Off by default: most suites never touch the payment path, and a chain
+   * container costs every one of them a start. The suites that do get a shop
+   * whose `WALLET_ADDRESS` is a real address on that chain.
+   */
+  withChain?: boolean;
 }
 
 /**
@@ -34,8 +54,11 @@ export interface ShopTestApp {
  * it asked for.
  */
 export async function startShopApp(
-  store: TestStore = 'postgres',
+  options: TestStore | ShopAppOptions = 'postgres',
 ): Promise<ShopTestApp> {
+  const { store = 'postgres', withChain = false } =
+    typeof options === 'string' ? { store: options } : options;
+
   const container =
     store === 'redis' ? await startRedis() : await startPostgres();
 
@@ -44,6 +67,19 @@ export async function startShopApp(
   process.env.SHOP_ADMIN_USERNAME = SEEDED_ADMIN.username;
   process.env.SHOP_ADMIN_PASSWORD = SEEDED_ADMIN.password;
   process.env.SHOP_ADMIN_DISPLAY_NAME = SEEDED_ADMIN.displayName;
+
+  let anvil: StartedAnvil | undefined;
+  if (withChain) {
+    anvil = await startAnvil();
+    // What the operator would pass through from the Shop resource.
+    process.env.WALLET_ADDRESS = ANVIL_ACCOUNTS.shop;
+    process.env.RPC_URL = anvil.rpcUrl;
+    process.env.CHAIN_ID = String(ANVIL_CHAIN_ID);
+    // Anvil mines on receipt and then stops, so waiting for depth would hang.
+    process.env.PAYMENT_CONFIRMATIONS = '0';
+  } else {
+    delete process.env.WALLET_ADDRESS;
+  }
 
   const { AppModule } = loadAppModule();
 
@@ -55,7 +91,7 @@ export async function startShopApp(
   configureApp(app);
   await app.init();
 
-  return { app, container };
+  return { app, container, anvil };
 }
 
 /**
@@ -106,6 +142,7 @@ export async function stopShopApp(testApp?: ShopTestApp): Promise<void> {
   }
   await testApp.app.close();
   await testApp.container.stop();
+  await testApp.anvil?.container.stop();
 }
 
 /** Decodes the payload of a JWT without verifying it. */

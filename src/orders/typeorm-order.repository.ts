@@ -9,12 +9,33 @@ import {
 import { Article } from '../articles/entities/article.entity';
 import { Order, OrderStatus } from './entities/order.entity';
 import {
+  ConfirmPaymentResult,
   FailPaymentResult,
   OrderDraft,
   OrderPageOptions,
   OrderRepository,
   PlaceOrderResult,
 } from './order.repository';
+
+/** PostgreSQL's `unique_violation`, raised by the transaction_hash index. */
+const UNIQUE_VIOLATION = '23505';
+
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  // TypeORM wraps the driver error in a QueryFailedError, copying the driver's
+  // own properties onto it. Which of the two carries `code` has moved between
+  // versions, so both are checked.
+  const wrapped = error as {
+    code?: unknown;
+    driverError?: { code?: unknown };
+  };
+  return (
+    wrapped.code === UNIQUE_VIOLATION ||
+    wrapped.driverError?.code === UNIQUE_VIOLATION
+  );
+}
 
 /**
  * Thrown to roll the checkout transaction back when a line has run out.
@@ -95,6 +116,7 @@ export class TypeOrmOrderRepository implements OrderRepository {
             total: draft.total,
             currency: draft.currency,
             status: OrderStatus.PENDING,
+            walletAddress: draft.walletAddress,
           }),
         );
       });
@@ -156,6 +178,43 @@ export class TypeOrmOrderRepository implements OrderRepository {
         ? { failed: false, reason: 'not-found' }
         : { failed: true, order: failed };
     });
+  }
+
+  async confirmPayment(
+    id: string,
+    transactionHash: string,
+  ): Promise<ConfirmPaymentResult> {
+    try {
+      // The expected status is part of the statement, so two payment results
+      // racing each other cannot both settle the order. The unique index on
+      // transaction_hash is the other half: it rejects a hash that already
+      // belongs to a different order, which is a check no SELECT could make
+      // safely from here.
+      const result = await this.orders
+        .createQueryBuilder()
+        .update(Order)
+        .set({ status: OrderStatus.PAID, transactionHash })
+        .where('id = :id', { id })
+        .andWhere('status = :from', { from: OrderStatus.PENDING })
+        .execute();
+
+      if ((result.affected ?? 0) === 0) {
+        const exists = await this.orders.existsBy({ id });
+        return exists
+          ? { confirmed: false, reason: 'not-pending' }
+          : { confirmed: false, reason: 'not-found' };
+      }
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        return { confirmed: false, reason: 'hash-used' };
+      }
+      throw error;
+    }
+
+    const paid = await this.findById(id);
+    return paid === null
+      ? { confirmed: false, reason: 'not-found' }
+      : { confirmed: true, order: paid };
   }
 
   /**

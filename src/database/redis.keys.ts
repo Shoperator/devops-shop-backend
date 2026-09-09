@@ -19,6 +19,11 @@ export const KEYS = {
   orderIndex: 'orders',
   /** The same, restricted to one customer. */
   buyerOrderIndex: (buyerId: string) => `orders:buyer:${buyerId}`,
+  /**
+   * Claims a transaction hash for the order it settled. Redis has no unique
+   * index, so this key is what stops one transfer paying for two baskets.
+   */
+  paymentClaim: (transactionHash: string) => `payments:by-tx:${transactionHash}`,
 } as const;
 
 /** Prefix the Lua scripts rebuild article keys from. */

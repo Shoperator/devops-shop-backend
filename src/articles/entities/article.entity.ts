@@ -18,7 +18,7 @@ export class Article {
   @Column({ type: 'text', nullable: true })
   description: string | null;
 
-  /** Price expressed in the shop currency (USDT). */
+  /** Price expressed in the shop currency (ETH). */
   @Column({
     type: 'numeric',
     precision: 18,

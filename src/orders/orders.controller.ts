@@ -18,6 +18,7 @@ import type { AuthenticatedUser } from '../auth/types/jwt-payload';
 import { PageDto } from '../common/dto/page.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { UserRole } from '../users/entities/user.entity';
+import { ConfirmPaymentDto } from './dto/confirm-payment.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
 import { OrderResponseDto } from './dto/order-response.dto';
@@ -51,6 +52,27 @@ export class OrdersController {
   ): Promise<PageDto<OrderResponseDto>> {
     const page = await this.ordersService.list(query);
     return PageDto.map(page, (order) => OrderResponseDto.fromEntity(order));
+  }
+
+  /**
+   * Settles an order with a transaction the customer's wallet already sent.
+   *
+   * Customer-only, and the service checks the order is theirs.
+   */
+  @Post(':id/payment')
+  @Roles(UserRole.CUSTOMER)
+  async confirmPayment(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ConfirmPaymentDto,
+  ): Promise<OrderResponseDto> {
+    return OrderResponseDto.fromEntity(
+      await this.ordersService.confirmPayment(
+        id,
+        user.id,
+        dto.transactionHash,
+      ),
+    );
   }
 
   // Declared before `:id`, which would otherwise swallow the path.

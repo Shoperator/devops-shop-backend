@@ -5,20 +5,25 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleInit,
+  UnprocessableEntityException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ARTICLE_REPOSITORY } from '../articles/article.repository';
+import { PaymentVerifierService } from '../payments/payment-verifier.service';
+import {
+  getShopWalletAddress,
+  SHOP_CURRENCY,
+} from '../payments/payment.config';
 import type { ArticleRepository } from '../articles/article.repository';
 import { PageDto } from '../common/dto/page.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
 import { OrderItem } from './entities/order-item';
-import { Order } from './entities/order.entity';
+import { Order, OrderStatus } from './entities/order.entity';
 import { ORDER_REPOSITORY } from './order.repository';
 import type { OrderRepository } from './order.repository';
-
-/** The crypto currency this shop prices and settles in. */
-const SHOP_CURRENCY = 'USDT';
 
 /** Money is stored as `numeric(18, 2)`; float addition drifts past that. */
 function toMoney(value: number): number {
@@ -29,7 +34,7 @@ function toMoney(value: number): number {
  * Orders placed by customers and listed by the shop admin.
  */
 @Injectable()
-export class OrdersService {
+export class OrdersService implements OnModuleInit {
   private readonly logger = new Logger(OrdersService.name);
 
   constructor(
@@ -37,7 +42,22 @@ export class OrdersService {
     private readonly orderRepository: OrderRepository,
     @Inject(ARTICLE_REPOSITORY)
     private readonly articleRepository: ArticleRepository,
+    private readonly config: ConfigService,
+    private readonly verifier: PaymentVerifierService,
   ) {}
+
+  /**
+   * A shop with no wallet is a shop that can sell but cannot be paid, and the
+   * orders stay pending.
+   * Logged at startup.
+   */
+  onModuleInit(): void {
+    if (getShopWalletAddress(this.config) === null) {
+      this.logger.warn(
+        'WALLET_ADDRESS is not set: orders will be created with no payment address and cannot be paid',
+      );
+    }
+  }
 
   /** Every order in the shop, newest first. Admin only. */
   async list(query: OrderQueryDto): Promise<PageDto<Order>> {
@@ -112,15 +132,20 @@ export class OrdersService {
       total += article.price * line.quantity;
     }
 
-    // Payment processing with a blockchain wallet is still to be implemented.
-    // Until then an order is created unpaid: the stock is held for the customer
-    // and the status says the money has not arrived yet. When the payment comes
-    // back rejected, `markPaymentFailed` puts it back.
+    // An order is created unpaid: the stock is held for the customer and the
+    // status says the money has not arrived yet. The customer's wallet then
+    // pays `walletAddress` and submits the transaction, which `confirmPayment`
+    // verifies; if it never arrives, `markPaymentFailed` puts the stock back.
+    //
+    // The address is copied onto the order rather than read again at payment
+    // time, so reconfiguring the shop cannot move where an order already placed
+    // was supposed to be paid.
     const result = await this.orderRepository.placeOrder({
       buyerId,
       items,
       total: toMoney(total),
       currency: SHOP_CURRENCY,
+      walletAddress: getShopWalletAddress(this.config),
     });
 
     if (!result.placed) {
@@ -135,6 +160,71 @@ export class OrdersService {
       `Order created: ${order.id} by ${buyerId} (${order.items.length} article(s), ${order.total} ${order.currency})`,
     );
     return order;
+  }
+
+  /**
+   * Settles an order against a transaction the customer has already sent.
+   *
+   * The order is found first so that a customer cannot probe another customer's
+   * orders: an id that is not theirs answers exactly as an id that does not
+   * exist. Verification comes next, and only a transaction the chain agrees
+   * with reaches the store — which then applies the two guards that cannot be
+   * checked from here without a race.
+   */
+  async confirmPayment(
+    id: string,
+    buyerId: string,
+    transactionHash: string,
+  ): Promise<Order> {
+    const order = await this.orderRepository.findById(id);
+    if (order === null || order.buyerId !== buyerId) {
+      throw new NotFoundException(`Order ${id} not found`);
+    }
+    if (order.status !== OrderStatus.PENDING) {
+      throw new ConflictException(
+        `Order ${id} is ${order.status.toLowerCase()} and cannot be paid again`,
+      );
+    }
+    if (order.walletAddress === null) {
+      // No address was configured when this order was placed, so there is
+      // nothing a transaction could have paid.
+      throw new ConflictException(
+        `Order ${id} has no payment address and cannot be paid`,
+      );
+    }
+
+    const verification = await this.verifier.verify(
+      transactionHash,
+      order.walletAddress,
+      order.total,
+    );
+    if (!verification.valid) {
+      this.logger.warn(
+        `Payment rejected for order ${id}: ${verification.reason} (${transactionHash})`,
+      );
+      throw new UnprocessableEntityException(verification.detail);
+    }
+
+    const result = await this.orderRepository.confirmPayment(
+      id,
+      transactionHash,
+    );
+
+    if (!result.confirmed) {
+      if (result.reason === 'not-found') {
+        throw new NotFoundException(`Order ${id} not found`);
+      }
+      // Both remaining reasons are lost races: another request settled this
+      // order, or this transaction had already paid a different one.
+      throw new ConflictException(
+        result.reason === 'hash-used'
+          ? `That transaction has already paid another order`
+          : `Order ${id} is no longer pending`,
+      );
+    }
+
+    this.logger.log(`Order paid: ${id} settled by ${transactionHash}`);
+    return result.order;
   }
 
   /**
@@ -169,4 +259,5 @@ export class OrdersService {
     );
     return result.order;
   }
+
 }
