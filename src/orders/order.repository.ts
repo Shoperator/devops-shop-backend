@@ -22,6 +22,13 @@ export interface OrderDraft {
   items: OrderItem[];
   total: number;
   currency: string;
+  /**
+   * The shop wallet this order is to be paid at, copied in rather than looked
+   * up later: reconfiguring the shop must not move where an order already
+   * placed was supposed to be paid. Null when the shop has no wallet
+   * configured, which leaves the order unpayable.
+   */
+  walletAddress: string | null;
 }
 
 export type PlaceOrderResult =
@@ -32,6 +39,15 @@ export type PlaceOrderResult =
 export type FailPaymentResult =
   | { failed: true; order: Order }
   | { failed: false; reason: 'not-found' | 'not-pending' };
+
+export type ConfirmPaymentResult =
+  | { confirmed: true; order: Order }
+  /**
+   * `hash-used` means that transaction already settled a different order. It is
+   * a store-level answer rather than a check in the service because only the
+   * store can make "claim this hash" and "mark this order paid" one step.
+   */
+  | { confirmed: false; reason: 'not-found' | 'not-pending' | 'hash-used' };
 
 /**
  * Orders, and the two operations that have to be all-or-nothing.
@@ -71,6 +87,23 @@ export interface OrderRepository {
    * caller that wins the status change releases the stock, so a payment result
    * delivered twice cannot return the same pieces twice. An article the admin
    * deleted meanwhile is skipped — there is no shelf left to put it back on.
+   *
    */
   failPayment(id: string): Promise<FailPaymentResult>;
+
+  /**
+   * Moves a PENDING order to PAID and records the transaction that settled it,
+   * as one step.
+   *
+   * The stock stays where it is: it was reserved at checkout and is now sold.
+   * Two guards live inside the write, because neither can be checked a moment
+   * earlier without a race. The status must still be PENDING, so a payment
+   * result delivered twice pays the order once; and the transaction hash must
+   * not already belong to another order, so one transfer cannot settle two
+   * baskets however many replicas of the shop are running.
+   */
+  confirmPayment(
+    id: string,
+    transactionHash: string,
+  ): Promise<ConfirmPaymentResult>;
 }

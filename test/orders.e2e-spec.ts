@@ -114,7 +114,7 @@ describe('Orders (e2e)', () => {
           },
         ],
         total: 25,
-        currency: 'USDT',
+        currency: 'ETH',
         status: OrderStatus.PENDING,
         ...overrides,
       }),
@@ -153,7 +153,7 @@ describe('Orders (e2e)', () => {
         buyerId: customer.user.id,
         // The money has not moved yet, so nothing may claim it has.
         status: OrderStatus.PENDING,
-        currency: 'USDT',
+        currency: 'ETH',
         total: 25,
         transactionHash: null,
       });
@@ -561,7 +561,7 @@ describe('Orders (e2e)', () => {
         },
       ]);
       expect(listed?.total).toBe(25);
-      expect(listed?.currency).toBe('USDT');
+      expect(listed?.currency).toBe('ETH');
     });
 
     it('returns the newest orders first', async () => {

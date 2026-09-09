@@ -2,9 +2,12 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { ARTICLE_REPOSITORY } from '../articles/article.repository';
+import { PaymentVerifierService } from '../payments/payment-verifier.service';
 import { Article } from '../articles/entities/article.entity';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
@@ -15,6 +18,8 @@ import { OrdersService } from './orders.service';
 const BUYER_ID = 'c0000000-0000-4000-8000-000000000001';
 const TEA_ID = 'a0000000-0000-4000-8000-000000000001';
 const MUG_ID = 'a0000000-0000-4000-8000-000000000002';
+/** What the operator passes through as WALLET_ADDRESS. Anvil's account #1. */
+const SHOP_WALLET = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
 
 function articleFixture(overrides: Partial<Article> = {}): Article {
   return {
@@ -43,7 +48,7 @@ function orderFixture(overrides: Partial<Order> = {}): Order {
       },
     ],
     total: 25,
-    currency: 'USDT',
+    currency: 'ETH',
     status: OrderStatus.PENDING,
     walletAddress: null,
     transactionHash: null,
@@ -75,12 +80,18 @@ describe('OrdersService', () => {
     findById: jest.Mock;
     placeOrder: jest.Mock;
     failPayment: jest.Mock;
+    confirmPayment: jest.Mock;
   };
   let articleRepository: {
     findByIds: jest.Mock;
   };
+  let verifier: { verify: jest.Mock };
+  let env: Record<string, string | undefined>;
 
   beforeEach(async () => {
+    env = { WALLET_ADDRESS: SHOP_WALLET };
+    verifier = { verify: jest.fn().mockResolvedValue({ valid: true }) };
+
     orderRepository = {
       findPage: jest.fn().mockResolvedValue([[], 0]),
       findById: jest.fn(),
@@ -94,12 +105,14 @@ describe('OrdersService', () => {
             items: draft.items,
             total: draft.total,
             currency: draft.currency,
+            walletAddress: draft.walletAddress,
           }),
         }),
       ),
       failPayment: jest.fn(() =>
         Promise.resolve({ failed: true, order: orderFixture() }),
       ),
+      confirmPayment: jest.fn(),
     };
 
     articleRepository = {
@@ -111,6 +124,11 @@ describe('OrdersService', () => {
         OrdersService,
         { provide: ORDER_REPOSITORY, useValue: orderRepository },
         { provide: ARTICLE_REPOSITORY, useValue: articleRepository },
+        {
+          provide: ConfigService,
+          useValue: { get: (key: string) => env[key] },
+        },
+        { provide: PaymentVerifierService, useValue: verifier },
       ],
     }).compile();
 
@@ -198,7 +216,7 @@ describe('OrdersService', () => {
       expect(order).toMatchObject({
         buyerId: BUYER_ID,
         status: OrderStatus.PENDING,
-        currency: 'USDT',
+        currency: 'ETH',
       });
     });
 
@@ -262,8 +280,29 @@ describe('OrdersService', () => {
         buyerId: BUYER_ID,
         items: expect.any(Array) as unknown[],
         total: 25,
-        currency: 'USDT',
+        currency: 'ETH',
+        walletAddress: SHOP_WALLET,
       });
+    });
+
+    it('copies the shop wallet onto the order, so a reconfigure cannot move it', async () => {
+      const order = await ordersService.checkout(BUYER_ID, {
+        items: [{ articleId: TEA_ID, quantity: 2 }],
+      });
+
+      expect(order.walletAddress).toBe(SHOP_WALLET);
+    });
+
+    it('still sells when the shop has no wallet, leaving the order unpayable', async () => {
+      // A missing WALLET_ADDRESS must not take the catalogue down with the
+      // payment path; the order is simply created with nowhere to pay.
+      env.WALLET_ADDRESS = undefined;
+
+      const order = await ordersService.checkout(BUYER_ID, {
+        items: [{ articleId: TEA_ID, quantity: 2 }],
+      });
+
+      expect(order.walletAddress).toBeNull();
     });
 
     it('refuses an article that ran out', async () => {
@@ -313,6 +352,126 @@ describe('OrdersService', () => {
         }),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(orderRepository.placeOrder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirmPayment', () => {
+    const TX =
+      '0x1111111111111111111111111111111111111111111111111111111111111111';
+
+    beforeEach(() => {
+      orderRepository.findById.mockResolvedValue(
+        orderFixture({ walletAddress: SHOP_WALLET }),
+      );
+      orderRepository.confirmPayment.mockImplementation(
+        (id: string, transactionHash: string) =>
+          Promise.resolve({
+            confirmed: true,
+            order: orderFixture({
+              id,
+              status: OrderStatus.PAID,
+              transactionHash,
+            }),
+          }),
+      );
+    });
+
+    it('settles the order and records the transaction', async () => {
+      const order = await ordersService.confirmPayment(
+        orderFixture().id,
+        BUYER_ID,
+        TX,
+      );
+
+      expect(order).toMatchObject({
+        status: OrderStatus.PAID,
+        transactionHash: TX,
+      });
+    });
+
+    it('verifies against the address stored on the order, not the current config', async () => {
+      // The shop may have been reconfigured since checkout; the money was sent
+      // to the address the customer was shown at the time.
+      const oldWallet = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+      orderRepository.findById.mockResolvedValue(
+        orderFixture({ walletAddress: oldWallet }),
+      );
+
+      await ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX);
+
+      expect(verifier.verify).toHaveBeenCalledWith(TX, oldWallet, 25);
+    });
+
+    it("hides another customer's order behind the same answer as a missing one", async () => {
+      // Answering 403 here would confirm the order exists, letting a customer
+      // enumerate other people's orders by id.
+      orderRepository.findById.mockResolvedValue(
+        orderFixture({ buyerId: 'c0000000-0000-4000-8000-000000000009' }),
+      );
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(orderRepository.confirmPayment).not.toHaveBeenCalled();
+    });
+
+    it('never reaches the store when the chain disagrees', async () => {
+      verifier.verify.mockResolvedValue({
+        valid: false,
+        reason: 'insufficient-amount',
+        detail: 'That transaction paid 1 wei, 25000000000000000000 wei was owed',
+      });
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(UnprocessableEntityException);
+      expect(orderRepository.confirmPayment).not.toHaveBeenCalled();
+    });
+
+    it('refuses an order that is already paid', async () => {
+      orderRepository.findById.mockResolvedValue(
+        orderFixture({ status: OrderStatus.PAID, walletAddress: SHOP_WALLET }),
+      );
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(verifier.verify).not.toHaveBeenCalled();
+    });
+
+    it('refuses an order placed while the shop had no wallet', async () => {
+      orderRepository.findById.mockResolvedValue(
+        orderFixture({ walletAddress: null }),
+      );
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(verifier.verify).not.toHaveBeenCalled();
+    });
+
+    it('refuses a transaction that already paid another order', async () => {
+      // The store owns this: only it can claim the hash and settle the order in
+      // one step, so only it can tell the loser of that race.
+      orderRepository.confirmPayment.mockResolvedValue({
+        confirmed: false,
+        reason: 'hash-used',
+      });
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('refuses when another request settled the order first', async () => {
+      orderRepository.confirmPayment.mockResolvedValue({
+        confirmed: false,
+        reason: 'not-pending',
+      });
+
+      await expect(
+        ordersService.confirmPayment(orderFixture().id, BUYER_ID, TX),
+      ).rejects.toBeInstanceOf(ConflictException);
     });
   });
 

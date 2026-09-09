@@ -42,7 +42,8 @@ export class Order {
   })
   total: number;
 
-  @Column({ length: 16, default: 'USDT' })
+  /** Defensive only: the service always writes `SHOP_CURRENCY` explicitly. */
+  @Column({ length: 16, default: 'ETH' })
   currency: string;
 
   @Column({ type: 'enum', enum: OrderStatus, default: OrderStatus.PENDING })
@@ -57,12 +58,20 @@ export class Order {
   })
   walletAddress: string | null;
 
-  /** Hash of the on-chain transaction that settled this order. */
+  /**
+   * Hash of the on-chain transaction that settled this order.
+   *
+   * Unique, so one transfer cannot settle two orders: a customer who pays once
+   * and submits the same hash against a second basket is stopped by the
+   * database rather than by a check that could race. PostgreSQL permits any
+   * number of NULLs under a unique constraint, so unpaid orders are unaffected.
+   */
   @Column({
     name: 'transaction_hash',
     type: 'varchar',
     length: 128,
     nullable: true,
+    unique: true,
   })
   transactionHash: string | null;
 

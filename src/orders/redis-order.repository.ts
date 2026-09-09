@@ -8,10 +8,12 @@ import {
   readDate,
   readNumber,
 } from '../database/redis.keys';
+import { SHOP_CURRENCY } from '../payments/payment.config';
 import { User, UserRole } from '../users/entities/user.entity';
 import { OrderItem } from './entities/order-item';
 import { Order, OrderStatus } from './entities/order.entity';
 import {
+  ConfirmPaymentResult,
   FailPaymentResult,
   OrderDraft,
   OrderPageOptions,
@@ -111,6 +113,49 @@ end
 return 0
 `;
 
+/**
+ * Moves a PENDING order to PAID and records the transaction, or changes nothing.
+ *
+ * Redis has no unique index, so the "one transfer settles one order" guarantee
+ * is a claim key taken inside the same script: `SET ... NX` succeeds for
+ * exactly one caller. Doing it here rather than as a separate command is what
+ * makes it hold across replicas — a claim taken and then abandoned by a failed
+ * status check would block the hash forever, which is why the status is checked
+ * first.
+ *
+ * KEYS  1   the order
+ *       2   the claim key for this transaction hash
+ * ARGV  1   the status the order must be in
+ *       2   the status to move it to
+ *       3   the transaction hash
+ *       4   the new updatedAt
+ *
+ * Returns 0 when the order was paid, -1 when there is no such order, -2 when it
+ * was not pending, and -3 when the hash already settled a different order.
+ */
+const CONFIRM_PAYMENT = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if not status then
+  return -1
+end
+if status ~= ARGV[1] then
+  return -2
+end
+
+local claimed = redis.call('SET', KEYS[2], KEYS[1], 'NX')
+if not claimed then
+  if redis.call('GET', KEYS[2]) ~= KEYS[1] then
+    return -3
+  end
+end
+
+redis.call('HSET', KEYS[1],
+  'status', ARGV[2],
+  'transactionHash', ARGV[3],
+  'updatedAt', ARGV[4])
+return 0
+`;
+
 function toOrder(id: string, hash: Hash): Order {
   const order = new Order();
   order.id = id;
@@ -119,7 +164,7 @@ function toOrder(id: string, hash: Hash): Order {
   order.items =
     hash.items === undefined ? [] : (JSON.parse(hash.items) as OrderItem[]);
   order.total = readNumber(hash.total);
-  order.currency = hash.currency ?? 'USDT';
+  order.currency = hash.currency ?? SHOP_CURRENCY;
   order.status =
     (hash.status as OrderStatus | undefined) ?? OrderStatus.PENDING;
   order.walletAddress = hash.walletAddress ?? null;
@@ -205,12 +250,15 @@ export class RedisOrderRepository implements OrderRepository {
       ...draft.items.map((item) => String(item.quantity)),
       String(now.getTime()),
       id,
+      // `hashFields` drops a null wallet address rather than writing the string
+      // "null", and `toOrder` reads an absent field back as null.
       ...hashFields({
         buyerId: draft.buyerId,
         items: JSON.stringify(draft.items),
         total: draft.total,
         currency: draft.currency,
         status: OrderStatus.PENDING,
+        walletAddress: draft.walletAddress,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
       }),
@@ -238,7 +286,7 @@ export class RedisOrderRepository implements OrderRepository {
     order.total = draft.total;
     order.currency = draft.currency;
     order.status = OrderStatus.PENDING;
-    order.walletAddress = null;
+    order.walletAddress = draft.walletAddress;
     order.transactionHash = null;
     order.createdAt = now;
     order.updatedAt = now;
@@ -246,7 +294,7 @@ export class RedisOrderRepository implements OrderRepository {
   }
 
   async failPayment(id: string): Promise<FailPaymentResult> {
-    const outcome = (await this.redis.client.eval(
+    const result = (await this.redis.client.eval(
       FAIL_PAYMENT,
       1,
       KEYS.order(id),
@@ -256,10 +304,10 @@ export class RedisOrderRepository implements OrderRepository {
       ARTICLE_KEY_PREFIX,
     )) as number;
 
-    if (outcome === -1) {
+    if (result === -1) {
       return { failed: false, reason: 'not-found' };
     }
-    if (outcome === -2) {
+    if (result === -2) {
       return { failed: false, reason: 'not-pending' };
     }
 
@@ -267,6 +315,37 @@ export class RedisOrderRepository implements OrderRepository {
     return order === null
       ? { failed: false, reason: 'not-found' }
       : { failed: true, order };
+  }
+
+  async confirmPayment(
+    id: string,
+    transactionHash: string,
+  ): Promise<ConfirmPaymentResult> {
+    const outcome = (await this.redis.client.eval(
+      CONFIRM_PAYMENT,
+      2,
+      KEYS.order(id),
+      KEYS.paymentClaim(transactionHash),
+      OrderStatus.PENDING,
+      OrderStatus.PAID,
+      transactionHash,
+      new Date().toISOString(),
+    )) as number;
+
+    if (outcome === -1) {
+      return { confirmed: false, reason: 'not-found' };
+    }
+    if (outcome === -2) {
+      return { confirmed: false, reason: 'not-pending' };
+    }
+    if (outcome === -3) {
+      return { confirmed: false, reason: 'hash-used' };
+    }
+
+    const order = await this.findById(id);
+    return order === null
+      ? { confirmed: false, reason: 'not-found' }
+      : { confirmed: true, order };
   }
 
   /** Reads several orders in one round trip, skipping any that are gone. */

@@ -26,7 +26,7 @@ const order: Order = {
     },
   ],
   total: 25,
-  currency: 'USDT',
+  currency: 'ETH',
   status: OrderStatus.PAID,
   walletAddress: '0xshop',
   transactionHash: '0xdeadbeef',
@@ -61,6 +61,6 @@ describe('OrderResponseDto', () => {
 
     expect(dto.items).toEqual(order.items);
     expect(dto.total).toBe(25);
-    expect(dto.currency).toBe('USDT');
+    expect(dto.currency).toBe('ETH');
   });
 });
